@@ -1,0 +1,15 @@
+{
+  "name": "esp32-tb-ota-test",
+  "private": true,
+  "version": "0.0.0-development",
+  "scripts": {
+    "release": "semantic-release"
+  },
+  "devDependencies": {
+    "@semantic-release/commit-analyzer": "^13.0.1",
+    "@semantic-release/exec": "^7.1.0",
+    "@semantic-release/github": "^11.0.1",
+    "@semantic-release/release-notes-generator": "^14.0.3",
+    "semantic-release": "^25.0.5"
+  }
+}

@@ -1,0 +1,60 @@
+name: ESP32 Release OTA
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: write
+  issues: write
+  pull-requests: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+
+    env:
+      FW_TITLE: esp32-tb-ota-test
+
+      WIFI_SSID: ${{ secrets.WIFI_SSID }}
+      WIFI_PASS: ${{ secrets.WIFI_PASS }}
+
+      TB_HOST: mytb.fabricadesoftware.ifc.edu.br
+      TB_PORT: 1883
+      TB_TOKEN: ${{ secrets.TB_TOKEN }}
+
+      TB_URL: ${{ secrets.TB_URL }}
+      TB_USERNAME: ${{ secrets.TB_USERNAME }}
+      TB_PASSWORD: ${{ secrets.TB_PASSWORD }}
+      TB_DEVICE_PROFILE_ID: ${{ secrets.TB_DEVICE_PROFILE_ID }}
+
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Python deps
+        run: |
+          pip install platformio requests
+
+      - name: Install Node deps
+        run: |
+          npm ci
+
+      - name: Semantic release
+        run: |
+          npm run release
