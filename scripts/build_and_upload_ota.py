@@ -211,3 +211,6 @@ def main():
     )
 
     print("[RELEASE] OTA criado, enviado e atribuído ao device com sucesso", flush=True)
+
+if __name__ == "__main__":
+    main()
