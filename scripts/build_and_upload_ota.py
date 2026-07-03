@@ -94,6 +94,44 @@ def upload_ota_file(tb_url, jwt, ota_package_id, firmware_path, checksum):
             f"Erro fazendo upload OTA: {response.status_code} {response.text}"
         )
 
+def assign_firmware_to_device(
+    tb_url: str, jwt: str, device_id: str, ota_package_id: str
+) -> None:
+    headers = {
+        "Content-Type": "application/json",
+        "X-Authorization": f"Bearer {jwt}",
+    }
+
+    get_url = f"{tb_url.rstrip('/')}/api/device/{device_id}"
+
+    response = requests.get(get_url, headers=headers, timeout=30)
+
+    if response.status_code >= 300:
+        raise RuntimeError(
+            f"Erro buscando device {device_id}: {response.status_code} {response.text}"
+        )
+
+    device = response.json()
+
+    device["firmwareId"] = {
+        "entityType": "OTA_PACKAGE",
+        "id": ota_package_id,
+    }
+
+    save_url = f"{tb_url.rstrip('/')}/api/device"
+
+    response = requests.post(save_url, json=device, headers=headers, timeout=30)
+
+    if response.status_code >= 300:
+        raise RuntimeError(
+            f"Erro vinculando firmware ao device: {response.status_code} {response.text}"
+        )
+
+    print(
+        f"[RELEASE] Firmware OTA {ota_package_id} vinculado automaticamente ao device {device_id}",
+        flush=True,
+    )
+
 
 def main():
     parser = argparse.ArgumentParser()
@@ -103,10 +141,29 @@ def main():
 
     version = args.version
 
-    tb_url = os.environ["TB_URL"]
-    tb_username = os.environ["TB_USERNAME"]
-    tb_password = os.environ["TB_PASSWORD"]
-    tb_device_profile_id = os.environ["TB_DEVICE_PROFILE_ID"]
+    tb_url = os.getenv("TB_URL", "").strip()
+    tb_username = os.getenv("TB_USERNAME", "").strip()
+    tb_password = os.getenv("TB_PASSWORD", "").strip()
+    tb_device_profile_id = os.getenv("TB_DEVICE_PROFILE_ID", "").strip()
+    tb_device_id = os.getenv("TB_DEVICE_ID", "").strip()
+
+    if not tb_url:
+        raise RuntimeError("TB_URL não definido.")
+
+    if not tb_url.startswith(("http://", "https://")):
+        raise RuntimeError("TB_URL precisa começar com http:// ou https://.")
+
+    if not tb_username:
+        raise RuntimeError("TB_USERNAME não definido.")
+
+    if not tb_password:
+        raise RuntimeError("TB_PASSWORD não definido.")
+
+    if not tb_device_profile_id:
+        raise RuntimeError("TB_DEVICE_PROFILE_ID não definido.")
+
+    if not tb_device_id:
+        raise RuntimeError("TB_DEVICE_ID não definido.")
 
     fw_title = os.getenv("FW_TITLE", "esp32-tb-ota-test")
 
@@ -114,8 +171,8 @@ def main():
     build_env["FW_VERSION"] = version
     build_env["FW_TITLE"] = fw_title
 
-    print(f"[RELEASE] Firmware title: {fw_title}")
-    print(f"[RELEASE] Firmware version: {version}")
+    print(f"[RELEASE] Firmware title: {fw_title}", flush=True)
+    print(f"[RELEASE] Firmware version: {version}", flush=True)
 
     run(["pio", "run", "-e", ENV_NAME], env=build_env)
 
@@ -124,8 +181,9 @@ def main():
 
     checksum = sha256_file(FIRMWARE_PATH)
 
-    print(f"[RELEASE] Firmware: {FIRMWARE_PATH}")
-    print(f"[RELEASE] SHA256: {checksum}")
+    print(f"[RELEASE] Firmware: {FIRMWARE_PATH}", flush=True)
+    print(f"[RELEASE] Tamanho: {FIRMWARE_PATH.stat().st_size} bytes", flush=True)
+    print(f"[RELEASE] SHA256: {checksum}", flush=True)
 
     jwt = login(tb_url, tb_username, tb_password)
 
@@ -145,8 +203,11 @@ def main():
         checksum=checksum,
     )
 
-    print("[RELEASE] OTA enviado para o ThingsBoard com sucesso")
+    assign_firmware_to_device(
+        tb_url=tb_url,
+        jwt=jwt,
+        device_id=tb_device_id,
+        ota_package_id=ota_id,
+    )
 
-
-if __name__ == "__main__":
-    main()
+    print("[RELEASE] OTA criado, enviado e atribuído ao device com sucesso", flush=True)
