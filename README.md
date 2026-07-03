@@ -197,15 +197,15 @@ FW_VERSION=1.0.0
 Use:
 
 ```gitignore
-.pio/
-.env
-include/generated_secrets.h
-
-.vscode/.browse_c_cpp.db*
+.pio
+.vscode/.browse.c_cpp.db*
 .vscode/c_cpp_properties.json
+.vscode/launch.json
+.vscode/ipch
+.env
+/node_modules
+/include/generated_secrets.h
 
-.DS_Store
-Thumbs.db
 ```
 
 ---
@@ -240,31 +240,7 @@ As senhas e tokens não ficam no `platformio.ini`. Elas são carregadas do `.env
 
 ---
 
-# 10. Tabela de partições OTA
-
-Crie `partitions_4mb_ota.csv`:
-
-```csv
-# Name,   Type, SubType, Offset,   Size,     Flags
-nvs,      data, nvs,     0x9000,   0x5000,
-otadata,  data, ota,     0xe000,   0x2000,
-app0,     app,  ota_0,   0x10000,  0x1E0000,
-app1,     app,  ota_1,   0x1F0000, 0x1E0000,
-spiffs,   data, spiffs,  0x3D0000, 0x30000,
-```
-
-Essa tabela cria duas partições de aplicação:
-
-```txt
-app0 → firmware atual
-app1 → novo firmware OTA
-```
-
-A primeira gravação precisa ser feita via USB para instalar essa tabela de partições.
-
----
-
-# 11. Script para carregar `.env`
+# 10. Script para carregar `.env`
 
 Crie `scripts/load_env.py`:
 
@@ -390,7 +366,7 @@ include/generated_secrets.h
 
 ---
 
-# 12. Firmware ESP32
+# 11. Firmware ESP32
 
 O firmware deve incluir:
 
@@ -435,7 +411,7 @@ v2/fw/response/+/chunk/+
 
 ---
 
-# 13. Primeiro upload via USB
+# 12. Primeiro upload via USB
 
 Antes de OTA funcionar, suba o firmware base por USB:
 
@@ -462,7 +438,7 @@ Device → Latest telemetry
 
 ---
 
-# 14. Criando pacote OTA manualmente
+# 13. Criando pacote OTA manualmente
 
 Para testar manualmente:
 
@@ -511,7 +487,7 @@ Selecione o firmware criado.
 
 ---
 
-# 15. O que o ESP32 deve mostrar durante OTA
+# 14. O que o ESP32 deve mostrar durante OTA
 
 No serial:
 
@@ -539,7 +515,7 @@ Depois do reboot:
 
 ---
 
-# 16. Integração com semantic-release
+# 15. Integração com semantic-release
 
 A ideia é fazer a versão do firmware ser gerada automaticamente pelos commits.
 
@@ -560,7 +536,7 @@ npm install -D semantic-release @semantic-release/commit-analyzer @semantic-rele
 
 ---
 
-# 17. `package.json`
+# 16. `package.json`
 
 Exemplo:
 
@@ -584,7 +560,7 @@ Exemplo:
 
 ---
 
-# 18. `.releaserc.json`
+# 17. `.releaserc.json`
 
 ```json
 {
@@ -612,7 +588,7 @@ python scripts/build_and_upload_ota.py --version 1.1.3
 
 ---
 
-# 19. Script para build e upload OTA
+# 18. Script para build e upload OTA
 
 Crie `scripts/build_and_upload_ota.py`:
 
@@ -854,7 +830,7 @@ if __name__ == "__main__":
 
 ---
 
-# 20. Secrets do GitHub Actions
+# 19. Secrets do GitHub Actions
 
 No GitHub:
 
@@ -910,7 +886,7 @@ O script já adiciona `/api/...`.
 
 ---
 
-# 21. GitHub Actions
+# 20. GitHub Actions
 
 Crie `.github/workflows/esp32-release.yml`:
 
@@ -980,7 +956,7 @@ jobs:
 
 ---
 
-# 22. Como criar uma nova versão
+# 21. Como criar uma nova versão
 
 Use Conventional Commits.
 
@@ -1017,7 +993,7 @@ O semantic-release vai:
 
 ---
 
-# 23. Logs esperados no GitHub Actions
+# 22. Logs esperados no GitHub Actions
 
 Quando tudo estiver correto, o log deve mostrar:
 
@@ -1039,7 +1015,7 @@ Call script python scripts/build_and_upload_ota.py --version 1.1.3
 
 ---
 
-# 24. Problemas comuns
+# 23. Problemas comuns
 
 ## Device fica ativo, mas não aparece telemetria
 
@@ -1120,7 +1096,7 @@ BREAKING CHANGE:
 
 ---
 
-# 25. Observação de segurança
+# 24. Observação de segurança
 
 Este projeto compila Wi-Fi e token do ThingsBoard dentro do firmware. Para testes isso é aceitável.
 
@@ -1148,7 +1124,7 @@ Também é recomendado:
 
 ---
 
-# 26. Fluxo final resumido
+# 25. Fluxo final resumido
 
 ```txt
 1. Criar device no ThingsBoard.
