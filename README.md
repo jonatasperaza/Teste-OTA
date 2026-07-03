@@ -223,8 +223,6 @@ framework = arduino
 monitor_speed = 115200
 upload_speed = 921600
 
-board_build.partitions = partitions_4mb_ota.csv
-
 extra_scripts =
   pre:scripts/load_env.py
 
