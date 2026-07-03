@@ -640,7 +640,7 @@ void setup()
 {
   pinMode(LED_PIN, OUTPUT);
   digitalWrite(LED_PIN, LOW);
-  Serial.println("slk o pae é bom dms");
+  Serial.println("slk o pae é bom dmsss");
 
   Serial.begin(115200);
   delay(500);
