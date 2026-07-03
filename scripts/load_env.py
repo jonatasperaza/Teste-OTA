@@ -1,152 +1,113 @@
-import argparse
-import hashlib
-import os
-import subprocess
-import sys
 from pathlib import Path
+import os
+import re
 
-import requests
+Import("env")
+
+PROJECT_DIR = Path(env.subst("$PROJECT_DIR"))
+ENV_FILE = PROJECT_DIR / ".env"
+OUT_FILE = PROJECT_DIR / "include" / "generated_secrets.h"
+
+REQUIRED_KEYS = [
+    "WIFI_SSID",
+    "WIFI_PASS",
+    "TB_HOST",
+    "TB_PORT",
+    "TB_TOKEN",
+    "FW_TITLE",
+    "FW_VERSION",
+]
+
+DEFAULTS = {
+    "TB_PORT": "1883",
+    "TB_HOST": "mytb.fabricadesoftware.ifc.edu.br",
+    "FW_TITLE": "esp32-tb-ota-test",
+    "FW_VERSION": "1.0.0",
+}
 
 
-ENV_NAME = "esp32doit-devkit-v1"
-FIRMWARE_PATH = Path(f".pio/build/{ENV_NAME}/firmware.bin")
+def parse_env_file(path: Path) -> dict:
+    values = {}
+
+    if not path.exists():
+        return values
+
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+
+        if not line or line.startswith("#"):
+            continue
+
+        if "=" not in line:
+            continue
+
+        key, value = line.split("=", 1)
+
+        key = key.strip()
+        value = value.strip()
+
+        # Remove aspas simples ou duplas, se existirem
+        if len(value) >= 2:
+            if (value[0] == value[-1]) and value[0] in ("'", '"'):
+                value = value[1:-1]
+
+        values[key] = value
+
+    return values
 
 
-def run(cmd, env=None):
-    print(f"[CMD] {' '.join(cmd)}")
-    result = subprocess.run(cmd, env=env)
-
-    if result.returncode != 0:
-        sys.exit(result.returncode)
+def cpp_string(value: str) -> str:
+    value = value.replace("\\", "\\\\")
+    value = value.replace('"', '\\"')
+    return f'"{value}"'
 
 
-def sha256_file(path: Path) -> str:
-    h = hashlib.sha256()
-
-    with path.open("rb") as f:
-        for chunk in iter(lambda: f.read(1024 * 1024), b""):
-            h.update(chunk)
-
-    return h.hexdigest()
+def is_int(value: str) -> bool:
+    return re.fullmatch(r"\d+", value or "") is not None
 
 
-def login(tb_url: str, username: str, password: str) -> str:
-    response = requests.post(
-        f"{tb_url.rstrip('/')}/api/auth/login",
-        json={"username": username, "password": password},
-        timeout=30,
+values = {}
+values.update(DEFAULTS)
+values.update(parse_env_file(ENV_FILE))
+
+# Variáveis de ambiente do sistema/GitHub Actions têm prioridade.
+for key in REQUIRED_KEYS:
+    if os.getenv(key):
+        values[key] = os.getenv(key)
+
+missing = [key for key in REQUIRED_KEYS if not values.get(key)]
+
+if missing:
+    raise RuntimeError(
+        "Variáveis ausentes: "
+        + ", ".join(missing)
+        + ". Crie um arquivo .env na raiz do projeto ou defina essas variáveis no ambiente."
     )
 
-    if response.status_code >= 300:
-        raise RuntimeError(
-            f"Login ThingsBoard falhou: {response.status_code} {response.text}"
-        )
+OUT_FILE.parent.mkdir(parents=True, exist_ok=True)
 
-    return response.json()["token"]
+lines = [
+    "#pragma once",
+    "",
+    "// Arquivo gerado automaticamente por scripts/load_env.py",
+    "// Não edite manualmente e não suba para o Git.",
+    "",
+]
 
+for key in REQUIRED_KEYS:
+    value = str(values[key])
 
-def create_ota_package(tb_url, jwt, title, version, device_profile_id):
-    payload = {
-        "title": title,
-        "version": version,
-        "tag": version,
-        "type": "FIRMWARE",
-        "deviceProfileId": {"entityType": "DEVICE_PROFILE", "id": device_profile_id},
-    }
+    if key == "TB_PORT":
+        if not is_int(value):
+            raise RuntimeError(f"TB_PORT precisa ser número. Valor recebido: {value}")
 
-    response = requests.post(
-        f"{tb_url.rstrip('/')}/api/otaPackage",
-        json=payload,
-        headers={
-            "Content-Type": "application/json",
-            "X-Authorization": f"Bearer {jwt}",
-        },
-        timeout=30,
-    )
+        lines.append(f"#define {key} {value}")
+    else:
+        lines.append(f"#define {key} {cpp_string(value)}")
 
-    if response.status_code >= 300:
-        raise RuntimeError(
-            f"Erro criando OTA package: {response.status_code} {response.text}"
-        )
+lines.append("")
 
-    return response.json()["id"]["id"]
+OUT_FILE.write_text("\n".join(lines), encoding="utf-8")
 
-
-def upload_ota_file(tb_url, jwt, ota_package_id, firmware_path, checksum):
-    with firmware_path.open("rb") as f:
-        response = requests.post(
-            f"{tb_url.rstrip('/')}/api/otaPackage/{ota_package_id}",
-            headers={
-                "X-Authorization": f"Bearer {jwt}",
-            },
-            data={
-                "checksum": checksum,
-                "checksumAlgorithm": "SHA256",
-            },
-            files={
-                "file": ("firmware.bin", f, "application/octet-stream"),
-            },
-            timeout=120,
-        )
-
-    if response.status_code >= 300:
-        raise RuntimeError(
-            f"Erro fazendo upload OTA: {response.status_code} {response.text}"
-        )
-
-
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--version", required=True)
-
-    args = parser.parse_args()
-
-    version = args.version
-
-    tb_url = os.environ["TB_URL"]
-    tb_username = os.environ["TB_USERNAME"]
-    tb_password = os.environ["TB_PASSWORD"]
-    tb_device_profile_id = os.environ["TB_DEVICE_PROFILE_ID"]
-
-    fw_title = os.getenv("FW_TITLE", "esp32-tb-ota-test")
-
-    build_env = os.environ.copy()
-    build_env["FW_VERSION"] = version
-    build_env["FW_TITLE"] = fw_title
-
-    print(f"[RELEASE] Firmware title: {fw_title}")
-    print(f"[RELEASE] Firmware version: {version}")
-
-    run(["pio", "run", "-e", ENV_NAME], env=build_env)
-
-    if not FIRMWARE_PATH.exists():
-        raise RuntimeError(f"Firmware não encontrado: {FIRMWARE_PATH}")
-
-    checksum = sha256_file(FIRMWARE_PATH)
-
-    print(f"[RELEASE] Firmware: {FIRMWARE_PATH}")
-    print(f"[RELEASE] SHA256: {checksum}")
-
-    jwt = login(tb_url, tb_username, tb_password)
-
-    ota_id = create_ota_package(
-        tb_url=tb_url,
-        jwt=jwt,
-        title=fw_title,
-        version=version,
-        device_profile_id=tb_device_profile_id,
-    )
-
-    upload_ota_file(
-        tb_url=tb_url,
-        jwt=jwt,
-        ota_package_id=ota_id,
-        firmware_path=FIRMWARE_PATH,
-        checksum=checksum,
-    )
-
-    print("[RELEASE] OTA enviado para o ThingsBoard com sucesso")
-
-
-if __name__ == "__main__":
-    main()
+print(f"[ENV] Gerado: {OUT_FILE}")
+print("[ENV] Variáveis carregadas: " + ", ".join(REQUIRED_KEYS))
