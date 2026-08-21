@@ -62,6 +62,8 @@ String chipId()
   return String(id);
 }
 
+
+
 void publishTelemetry(const String &json)
 {
   Serial.print("[TB] Telemetria: ");
