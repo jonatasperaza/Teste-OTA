@@ -19,7 +19,7 @@ static const char *TOPIC_FW_RESPONSE = "v2/fw/response/+/chunk/+";
 
 static const size_t OTA_CHUNK_SIZE = 4096;
 static const unsigned long MQTT_RECONNECT_MS = 3000;
-static const unsigned long TELEMETRY_INTERVAL_MS = 10000;
+static const unsigned long TELEMETRY_INTERVAL_MS = 5000;
 static const unsigned long OTA_CHUNK_TIMEOUT_MS = 30000;
 
 // ─────────────────────────────────────────────
@@ -130,7 +130,7 @@ void publishPeriodicTelemetry()
 {
   JsonDocument doc;
 
-  doc["temperature"] = 25;
+  doc["temperature"] = temperatureRead();
   doc["uptime_ms"] = millis();
   doc["free_heap"] = ESP.getFreeHeap();
   doc["rssi"] = WiFi.RSSI();
