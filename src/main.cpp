@@ -3,6 +3,9 @@
 #include <PubSubClient.h>
 #include <ArduinoJson.h>
 #include <Update.h>
+#include <OneWire.h>
+#include <DallasTemperature.h>
+#include <WiFiManager.h>
 #include "mbedtls/md.h"
 
 #include "generated_secrets.h"
@@ -11,27 +14,96 @@
 // Constantes
 // ─────────────────────────────────────────────
 static const int LED_PIN = 2;
+static const int LIMIT_SENSOR_PIN = 13;
+
+// Sensor HYBI1067: ajustar conforme fio comum (NPN puxa LOW no limite, PNP puxa HIGH).
+// Se nao souber, deixa true e testa: se nunca disparar, troca pra false.
+static const bool LIMIT_ACTIVE_LOW = true;
+static const unsigned long LIMIT_DEBOUNCE_MS = 50;
+
+static const int DS18B20_PIN = 32;
+
+// Sensor de fluxo YF-S201: sinal (amarelo) via divisor de tensao (5V -> ~3.3V). 450 pulsos/litro (datasheet).
+static const int FLOW_SENSOR_PIN = 27;
+static const float FLOW_PULSES_PER_LITER = 450.0;
 
 static const char *TOPIC_TELEMETRY = "v1/devices/me/telemetry";
 static const char *TOPIC_ATTRIBUTES = "v1/devices/me/attributes";
 static const char *TOPIC_ATTR_RESPONSE = "v1/devices/me/attributes/response/+";
 static const char *TOPIC_FW_RESPONSE = "v2/fw/response/+/chunk/+";
+static const char *TOPIC_RPC_REQUEST = "v1/devices/me/rpc/request/+";
 
 static const size_t OTA_CHUNK_SIZE = 4096;
-static const unsigned long MQTT_RECONNECT_MS = 3000;
-static const unsigned long TELEMETRY_INTERVAL_MS = 5000;
 static const unsigned long OTA_CHUNK_TIMEOUT_MS = 30000;
+
+// Tudo (temperatura, rssi, limite, vazao...) e medido e publicado junto, a cada 1s.
+static const unsigned long SAMPLE_INTERVAL_MS = 2000;
+
+// Backoff exponencial de reconexao MQTT: evita bombardear reconexao quando o sinal fica instavel.
+static const unsigned long MQTT_RECONNECT_MIN_MS = 3000;
+static const unsigned long MQTT_RECONNECT_MAX_MS = 30000;
 
 // ─────────────────────────────────────────────
 // Globais
 // ─────────────────────────────────────────────
 WiFiClient wifiClient;
 PubSubClient mqtt(wifiClient);
+WiFiManager wm;
+
+OneWire oneWire(DS18B20_PIN);
+DallasTemperature ds18b20(&oneWire);
 
 unsigned long lastMqttTry = 0;
-unsigned long lastTelemetry = 0;
+unsigned long mqttReconnectInterval = MQTT_RECONNECT_MIN_MS;
+unsigned long lastSample = 0;
 unsigned long lastBlink = 0;
 bool ledState = false;
+
+// Enquanto tenta conectar no WiFi salvo, LED pulsa rapido. Com o portal de config (AP) aberto, pulsa devagar.
+// Conectado, fica aceso fixo.
+enum LedPattern
+{
+  LED_PATTERN_CONNECTING,
+  LED_PATTERN_AP_CONFIG,
+  LED_PATTERN_CONNECTED
+};
+
+LedPattern ledPattern = LED_PATTERN_CONNECTING;
+bool apPortalActive = false;
+bool prevWifiConnected = false;
+
+bool limitReached = false;
+bool limitReadingRaw = false;
+unsigned long limitLastChangeAt = 0;
+
+portMUX_TYPE flowMux = portMUX_INITIALIZER_UNLOCKED;
+volatile uint32_t flowPulseCount = 0;
+uint32_t lastFlowPulseSnapshot = 0;
+float totalLiters = 0; // acumulado em RAM, zera se reiniciar
+float currentFlowRateLmin = 0;
+
+void IRAM_ATTR onFlowPulse()
+{
+  portENTER_CRITICAL_ISR(&flowMux);
+  flowPulseCount++;
+  portEXIT_CRITICAL_ISR(&flowMux);
+}
+
+// Chamado todo ciclo de SAMPLE_INTERVAL_MS (1s), junto com o resto da telemetria.
+void updateFlowRate()
+{
+  portENTER_CRITICAL(&flowMux);
+  uint32_t pulsesNow = flowPulseCount;
+  portEXIT_CRITICAL(&flowMux);
+
+  uint32_t intervalPulses = pulsesNow - lastFlowPulseSnapshot;
+  lastFlowPulseSnapshot = pulsesNow;
+
+  float intervalLiters = intervalPulses / FLOW_PULSES_PER_LITER;
+  totalLiters += intervalLiters;
+
+  currentFlowRateLmin = intervalLiters / (SAMPLE_INTERVAL_MS / 60000.0f);
+}
 
 int attrRequestId = 1;
 int fwRequestId = 1;
@@ -62,7 +134,33 @@ String chipId()
   return String(id);
 }
 
+// LED: pulsa rapido tentando conectar, pulsa devagar com o portal de config aberto, fixo quando conectado.
+void updateStatusLed()
+{
+  if (ledPattern == LED_PATTERN_CONNECTED)
+  {
+    digitalWrite(LED_PIN, HIGH);
+    return;
+  }
 
+  unsigned long interval = (ledPattern == LED_PATTERN_AP_CONFIG) ? 600 : 120;
+
+  if (millis() - lastBlink > interval)
+  {
+    lastBlink = millis();
+    ledState = !ledState;
+    digitalWrite(LED_PIN, ledState ? HIGH : LOW);
+  }
+}
+
+// Chamado pela WiFiManager quando nao consegue conectar com as credenciais salvas e sobe o AP de configuracao.
+void onConfigPortalStarted(WiFiManager *wmInstance)
+{
+  apPortalActive = true;
+
+  Serial.print("[WiFi] Sem conexao. Portal de configuracao ativo. Conecte no AP: ");
+  Serial.println(wmInstance->getConfigPortalSSID());
+}
 
 void publishTelemetry(const String &json)
 {
@@ -128,21 +226,78 @@ void publishBootInfo()
   publishTelemetry(json);
 }
 
+// Le tudo (temperatura, rssi, limite, vazao...) e publica junto, a cada SAMPLE_INTERVAL_MS (1s).
 void publishPeriodicTelemetry()
 {
   JsonDocument doc;
 
-  doc["temperature"] = temperatureRead();
+  ds18b20.requestTemperatures();
+  float temp = ds18b20.getTempCByIndex(0);
+
+  if (temp == DEVICE_DISCONNECTED_C)
+  {
+    Serial.println("[DS18B20] Sensor nao respondeu (verifique pull-up 4.7k no pino 32)");
+  }
+  else
+  {
+    doc["temperature"] = temp;
+  }
+
   doc["uptime_ms"] = millis();
   doc["free_heap"] = ESP.getFreeHeap();
   doc["rssi"] = WiFi.RSSI();
+  doc["ip"] = WiFi.localIP().toString();
   doc["fw_title"] = FW_TITLE;
   doc["fw_version"] = FW_VERSION;
+  doc["limit_reached"] = limitReached;
+  doc["flow_rate_lmin"] = currentFlowRateLmin;
+  doc["total_liters"] = totalLiters;
 
   String json;
   serializeJson(doc, json);
 
   publishTelemetry(json);
+}
+
+void publishLimitEvent()
+{
+  JsonDocument doc;
+  doc["limit_reached"] = limitReached;
+
+  ds18b20.requestTemperatures();
+  float temp = ds18b20.getTempCByIndex(0);
+
+  if (temp != DEVICE_DISCONNECTED_C)
+  {
+    doc["temperature"] = temp;
+  }
+
+  String json;
+  serializeJson(doc, json);
+
+  publishTelemetry(json);
+}
+
+// Le o sensor HYBI1067 com debounce e publica na hora que muda de estado.
+void checkLimitSensor()
+{
+  bool raw = digitalRead(LIMIT_SENSOR_PIN) == (LIMIT_ACTIVE_LOW ? LOW : HIGH);
+
+  if (raw != limitReadingRaw)
+  {
+    limitReadingRaw = raw;
+    limitLastChangeAt = millis();
+  }
+
+  if (millis() - limitLastChangeAt >= LIMIT_DEBOUNCE_MS && limitReadingRaw != limitReached)
+  {
+    limitReached = limitReadingRaw;
+
+    Serial.print("[LIMIT] Estado mudou: ");
+    Serial.println(limitReached ? "LIMITE ATINGIDO" : "livre");
+
+    publishLimitEvent();
+  }
 }
 
 // ─────────────────────────────────────────────
@@ -514,6 +669,29 @@ void requestSharedAttributes()
 }
 
 // ─────────────────────────────────────────────
+// RPC (comandos vindos do ThingsBoard)
+// ─────────────────────────────────────────────
+void onRpcRequest(const String &requestId, const char *method, JsonVariant params)
+{
+  Serial.print("[RPC] Metodo: ");
+  Serial.println(method);
+
+  if (strcmp(method, "getLimitState") == 0)
+  {
+    if (mqtt.connected())
+    {
+      String respTopic = "v1/devices/me/rpc/response/" + requestId;
+      String resp = String("{\"limit_reached\":") + (limitReached ? "true" : "false") + "}";
+      mqtt.publish(respTopic.c_str(), resp.c_str());
+    }
+
+    return;
+  }
+
+  Serial.println("[RPC] Metodo desconhecido, ignorado");
+}
+
+// ─────────────────────────────────────────────
 // MQTT callback
 // ─────────────────────────────────────────────
 void mqttCallback(char *topic, uint8_t *payload, unsigned int length)
@@ -523,6 +701,35 @@ void mqttCallback(char *topic, uint8_t *payload, unsigned int length)
   if (topicStr.startsWith("v2/fw/response/"))
   {
     handleFirmwareChunk(payload, length);
+    return;
+  }
+
+  if (topicStr.startsWith("v1/devices/me/rpc/request/"))
+  {
+    String requestId = topicStr.substring(topicStr.lastIndexOf('/') + 1);
+
+    String msg;
+    msg.reserve(length + 1);
+
+    for (unsigned int i = 0; i < length; i++)
+    {
+      msg += (char)payload[i];
+    }
+
+    JsonDocument doc;
+    DeserializationError err = deserializeJson(doc, msg);
+
+    if (err)
+    {
+      Serial.print("[RPC] Erro no JSON: ");
+      Serial.println(err.c_str());
+      return;
+    }
+
+    const char *method = doc["method"] | "";
+    JsonVariant params = doc["params"];
+
+    onRpcRequest(requestId, method, params);
     return;
   }
 
@@ -572,25 +779,33 @@ void mqttCallback(char *topic, uint8_t *payload, unsigned int length)
 // ─────────────────────────────────────────────
 // Wi-Fi e MQTT
 // ─────────────────────────────────────────────
-void connectWiFi()
+// Em vez de WiFi fixo (SSID/senha gravados no firmware), sobe um AP de configuracao quando nao
+// tem credencial salva (ou ela parou de funcionar). Conecta o celular no AP, abre o portal
+// (IP 192.168.4.1, captive portal deve abrir sozinho) e configura o WiFi da estufa por la.
+// Nao bloqueia o loop: portal roda em paralelo, LED indica em qual fase ta.
+void startWiFi()
 {
-  WiFi.mode(WIFI_STA);
+  wm.setAPCallback(onConfigPortalStarted);
+  wm.setConfigPortalBlocking(false);
+
+  String apName = "ESP32-Estufa-" + chipId();
+
+  Serial.print("[WiFi] Iniciando. AP de configuracao (se precisar): ");
+  Serial.println(apName);
+
+  wm.autoConnect(apName.c_str());
+}
+
+// Roda uma vez, na primeira transicao pra "conectado" (boot ou reconexao apos queda).
+void onWiFiConnected()
+{
+  apPortalActive = false;
+
+  WiFi.setTxPower(WIFI_POWER_19_5dBm); // potencia maxima: ajuda a atravessar a malha de aco da estufa
   WiFi.setSleep(false);
   WiFi.setAutoReconnect(true);
 
-  Serial.print("[WiFi] Conectando em ");
-  Serial.println(WIFI_SSID);
-
-  WiFi.begin(WIFI_SSID, WIFI_PASS);
-
-  while (WiFi.status() != WL_CONNECTED)
-  {
-    delay(300);
-    Serial.print(".");
-  }
-
-  Serial.println();
-  Serial.print("[WiFi] OK. IP: ");
+  Serial.print("[WiFi] Conectado. IP: ");
   Serial.println(WiFi.localIP());
 }
 
@@ -599,7 +814,7 @@ void connectMQTT()
   if (mqtt.connected())
     return;
 
-  if (millis() - lastMqttTry < MQTT_RECONNECT_MS)
+  if (millis() - lastMqttTry < mqttReconnectInterval)
     return;
 
   lastMqttTry = millis();
@@ -620,16 +835,26 @@ void connectMQTT()
   {
     Serial.print("[MQTT] Falhou. State: ");
     Serial.println(mqtt.state());
+
+    mqttReconnectInterval = min(mqttReconnectInterval * 2, MQTT_RECONNECT_MAX_MS);
+
+    Serial.print("[MQTT] Proxima tentativa em ");
+    Serial.print(mqttReconnectInterval / 1000);
+    Serial.println("s");
+
     return;
   }
+
+  mqttReconnectInterval = MQTT_RECONNECT_MIN_MS;
 
   Serial.println("[MQTT] Conectado");
 
   mqtt.subscribe(TOPIC_ATTRIBUTES);
   mqtt.subscribe(TOPIC_ATTR_RESPONSE);
   mqtt.subscribe(TOPIC_FW_RESPONSE);
+  mqtt.subscribe(TOPIC_RPC_REQUEST);
 
-  Serial.println("[MQTT] Subscrito em atributos e OTA");
+  Serial.println("[MQTT] Subscrito em atributos, OTA e RPC");
 
   publishBootInfo();
   requestSharedAttributes();
@@ -642,7 +867,16 @@ void setup()
 {
   pinMode(LED_PIN, OUTPUT);
   digitalWrite(LED_PIN, LOW);
-  Serial.println("slk o pae é bbbom dmsss");
+
+  pinMode(LIMIT_SENSOR_PIN, INPUT_PULLUP);
+  limitReadingRaw = digitalRead(LIMIT_SENSOR_PIN) == (LIMIT_ACTIVE_LOW ? LOW : HIGH);
+  limitReached = limitReadingRaw;
+
+  pinMode(DS18B20_PIN, INPUT_PULLUP);
+  ds18b20.begin();
+
+  pinMode(FLOW_SENSOR_PIN, INPUT);
+  attachInterrupt(digitalPinToInterrupt(FLOW_SENSOR_PIN), onFlowPulse, RISING);
 
   Serial.begin(115200);
   delay(500);
@@ -658,7 +892,7 @@ void setup()
   Serial.println(chipId());
   Serial.println("══════════════════════════════════════");
 
-  connectWiFi();
+  startWiFi();
 
   mqtt.setServer(TB_HOST, TB_PORT);
   mqtt.setCallback(mqttCallback);
@@ -669,32 +903,43 @@ void setup()
 
 void loop()
 {
-  if (WiFi.status() != WL_CONNECTED)
+  wm.process(); // atende requisicoes do portal de config (se o AP estiver ativo) sem travar o loop
+
+  bool wifiConnected = (WiFi.status() == WL_CONNECTED);
+
+  ledPattern = wifiConnected ? LED_PATTERN_CONNECTED : (apPortalActive ? LED_PATTERN_AP_CONFIG : LED_PATTERN_CONNECTING);
+  updateStatusLed();
+
+  if (!wifiConnected)
   {
-    Serial.println("[WiFi] Desconectado. Reconectando...");
-    WiFi.reconnect();
-    delay(1000);
+    prevWifiConnected = false;
     return;
+  }
+
+  if (!prevWifiConnected)
+  {
+    prevWifiConnected = true;
+    onWiFiConnected();
   }
 
   connectMQTT();
   mqtt.loop();
+
+  checkLimitSensor();
 
   if (otaInProgress && millis() - lastChunkAt > OTA_CHUNK_TIMEOUT_MS)
   {
     failOTA("Timeout esperando chunk OTA");
   }
 
-  if (!otaInProgress && millis() - lastTelemetry > TELEMETRY_INTERVAL_MS)
+  if (millis() - lastSample > SAMPLE_INTERVAL_MS)
   {
-    lastTelemetry = millis();
-    publishPeriodicTelemetry();
-  }
+    lastSample = millis();
+    updateFlowRate();
 
-  if (millis() - lastBlink > 500)
-  {
-    lastBlink = millis();
-    ledState = !ledState;
-    digitalWrite(LED_PIN, ledState ? HIGH : LOW);
+    if (!otaInProgress)
+    {
+      publishPeriodicTelemetry();
+    }
   }
 }
